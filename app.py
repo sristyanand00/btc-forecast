@@ -4,43 +4,38 @@ import pandas as pd
 import numpy as np
 from scipy import stats
 import plotly.graph_objects as go
+import json
+import os
 from datetime import datetime, timezone
-from supabase import create_client
 
 st.set_page_config(page_title="BTC Next-Hour Forecast", page_icon="₿", layout="wide")
 
 # ================================================================
-# SUPABASE CONNECTION
+# PART C — PERSISTENCE (Local File)
 # ================================================================
-@st.cache_resource
-def get_supabase():
-    url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_KEY"]
-    return create_client(url, key)
+HISTORY_FILE = "prediction_history.jsonl"
 
-supabase = get_supabase()
-
-# ================================================================
-# PART C — PERSISTENCE via Supabase
-# ================================================================
 def load_history():
-    res = supabase.table("predictions").select("*").order("id", desc=True).limit(100).execute()
-    return res.data if res.data else []
+    if not os.path.exists(HISTORY_FILE):
+        return []
+    with open(HISTORY_FILE, "r") as f:
+        return [json.loads(line) for line in f if line.strip()]
 
 def save_prediction(record):
-    supabase.table("predictions").upsert(record, on_conflict="predicted_for").execute()
+    with open(HISTORY_FILE, "a") as f:
+        f.write(json.dumps(record) + "\n")
 
 def update_actuals(history, prices):
     price_dict = {str(t): float(p) for t, p in zip(prices.index, prices.values)}
+    updated = []
     for r in history:
         if r["actual"] is None:
             actual_price = price_dict.get(r["predicted_for"])
             if actual_price:
-                supabase.table("predictions").update({
-                    "actual": round(actual_price, 2),
-                    "hit"   : int(r["lower_95"] <= actual_price <= r["upper_95"])
-                }).eq("predicted_for", r["predicted_for"]).execute()
-    return load_history()
+                r["actual"] = round(actual_price, 2)
+                r["hit"]    = int(r["lower_95"] <= actual_price <= r["upper_95"])
+        updated.append(r)
+    return updated
 
 # ================================================================
 # DATA FETCH
@@ -192,7 +187,12 @@ if not already_saved:
         "hit"          : None
     }
     save_prediction(new_record)
-    history = load_history()
+    history.append(new_record)
+
+# Rewrite file with updated actuals
+with open(HISTORY_FILE, "w") as f:
+    for r in history:
+        f.write(json.dumps(r) + "\n")
 
 if history:
     hist_df = pd.DataFrame(history[::-1])  # newest first
