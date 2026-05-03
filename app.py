@@ -7,8 +7,18 @@ import plotly.graph_objects as go
 import json
 import os
 from datetime import datetime, timezone
+import pytz
 
 st.set_page_config(page_title="BTC Next-Hour Forecast", page_icon="₿", layout="wide")
+
+def utc_to_ist(utc_dt_str):
+    """Convert UTC datetime string to IST format"""
+    try:
+        utc_dt = pd.to_datetime(utc_dt_str)
+        ist_dt = utc_dt.tz_convert('Asia/Kolkata')
+        return ist_dt.strftime('%Y-%m-%d %H:%M IST')
+    except:
+        return utc_dt_str
 
 # ================================================================
 # PART C — PERSISTENCE (Local File)
@@ -79,12 +89,28 @@ def predict_next_hour(prices):
     recent_100 = log_ret.iloc[-100:]
     recent_vol = log_ret.iloc[-20:].std()
     full_vol   = recent_100.std()
+
+    # Time of day multiplier — volatile hours mein wide range
+    current_hour = prices.index[-1].hour  # UTC
+    if   current_hour in [12,13,14,15,16]: time_mult = 1.35  # US market open
+    elif current_hour in [8,9,10,11]:      time_mult = 1.20  # EU market open
+    elif current_hour in [0,1,2,3]:        time_mult = 1.10  # Asia session
+    elif current_hour in [4,5,6,7]:        time_mult = 0.90  # Dead hours
+    else:                                  time_mult = 1.10
+
+    # Spike detector — pichle 3 bars mein bada move?
+    recent_3_vol = log_ret.iloc[-3:].abs().mean()
+    avg_vol      = log_ret.iloc[-50:].abs().mean()
+    if recent_3_vol > avg_vol * 2:
+        time_mult *= 1.20  # automatically wider
+
     try:
         df_t, loc_t, scale_t = stats.t.fit(recent_100)
-        scale_adj = scale_t * (recent_vol / full_vol) * 1.4 if full_vol > 0 else scale_t * 1.4
+        scale_adj = scale_t * (recent_vol / full_vol) * 1.4 * time_mult if full_vol > 0 else scale_t * 1.4 * time_mult
         df_t = max(df_t, 4.0)
     except:
-        df_t, loc_t, scale_adj = 5.0, 0.0, recent_vol
+        df_t, loc_t, scale_adj = 5.0, 0.0, recent_vol * 1.4 * time_mult
+
     S0         = float(prices.iloc[-1])
     sim_ret    = stats.t.rvs(df_t, loc=loc_t, scale=scale_adj, size=50_000)
     sim_prices = S0 * np.exp(sim_ret)
@@ -245,6 +271,15 @@ st.divider()
 # ================================================================
 st.subheader("🕐 Prediction History")
 st.caption("Every dashboard visit saves a prediction. Actuals fill in automatically when the bar closes.")
+with st.expander("🔧 Admin — Delete a row"):
+    del_time = st.text_input("Predicting For value paste karo:")
+    if st.button("Delete Row"):
+        history = [r for r in history if r["predicted_for"] != del_time]
+        with open(HISTORY_FILE, "w") as f:
+            for r in history:
+                f.write(json.dumps(r) + "\n")
+        st.success("Deleted!")
+        st.rerun()
 
 # Save current prediction if not already saved for this bar
 predicted_for = str(next_bar_time)
@@ -273,9 +308,14 @@ if history:
     hist_df["hit"]   = hist_df["hit"].apply(
         lambda x: "✅ Hit" if x == 1 else ("❌ Miss" if x == 0 else "⏳ Pending")
     )
+    
+    # Convert UTC timestamps to IST
+    hist_df["saved_at"] = hist_df["saved_at"].apply(utc_to_ist)
+    hist_df["predicted_for"] = hist_df["predicted_for"].apply(utc_to_ist)
+    
     hist_df = hist_df.rename(columns={
-        "saved_at"     : "Saved At (UTC)",
-        "predicted_for": "Predicting For",
+        "saved_at"     : "Saved At (IST)",
+        "predicted_for": "Predicting For (IST)",
         "lower_95"     : "Lower $",
         "upper_95"     : "Upper $",
         "actual"       : "Actual $",
