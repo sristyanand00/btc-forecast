@@ -25,6 +25,18 @@ def save_prediction(record):
     with open(HISTORY_FILE, "a") as f:
         f.write(json.dumps(record) + "\n")
 
+def calculate_winkler_score(lower, upper, actual):
+    """Calculate Winkler score for a single prediction"""
+    width = upper - lower
+    if lower <= actual <= upper:
+        return width
+    else:
+        # Penalty for missing the range
+        if actual < lower:
+            return width + 2 * (lower - actual)
+        else:
+            return width + 2 * (actual - upper)
+
 def update_actuals(history, prices):
     price_dict = {str(t): float(p) for t, p in zip(prices.index, prices.values)}
     updated = []
@@ -34,6 +46,8 @@ def update_actuals(history, prices):
             if actual_price:
                 r["actual"] = round(actual_price, 2)
                 r["hit"]    = int(r["lower_95"] <= actual_price <= r["upper_95"])
+                # Calculate Winkler score
+                r["winkler_score"] = calculate_winkler_score(r["lower_95"], r["upper_95"], r["actual"])
         updated.append(r)
     return updated
 
@@ -219,3 +233,71 @@ if history:
         st.info(f"Live coverage from {len(settled)} settled predictions: **{live_coverage*100:.1f}%** (target: 95.0%)")
 else:
     st.info("No history yet. Visit again after the next bar closes to see predictions fill in.")
+
+st.divider()
+
+# ================================================================
+# WINKLER SCORE ANALYSIS
+# ================================================================
+st.subheader("📊 Hour-wise Winkler Score Analysis")
+st.caption("Track prediction quality over time - lower scores are better")
+
+# Get predictions with actuals and winkler scores
+settled_predictions = [r for r in history if r.get("actual") is not None and r.get("winkler_score") is not None]
+
+if settled_predictions:
+    # Create DataFrame for analysis
+    winkler_df = pd.DataFrame(settled_predictions)
+    winkler_df['predicted_for'] = pd.to_datetime(winkler_df['predicted_for'])
+    winkler_df = winkler_df.sort_values('predicted_for')
+    
+    # Summary statistics
+    avg_winkler = winkler_df['winkler_score'].mean()
+    recent_avg = winkler_df.tail(24)['winkler_score'].mean()  # Last 24 hours
+    
+    col1, col2 = st.columns(2)
+    col1.metric("Overall Avg Winkler", f"${avg_winkler:.2f}")
+    col2.metric("Last 24h Avg Winkler", f"${recent_avg:.2f}")
+    
+    # Create Winkler score chart
+    fig_winkler = go.Figure()
+    
+    fig_winkler.add_trace(go.Scatter(
+        x=winkler_df['predicted_for'],
+        y=winkler_df['winkler_score'],
+        mode='lines+markers',
+        name='Winkler Score',
+        line=dict(color='#FF6B6B', width=2),
+        marker=dict(size=4)
+    ))
+    
+    # Add average line
+    fig_winkler.add_hline(
+        y=avg_winkler,
+        line_dash="dash",
+        line_color="#4ECDC4",
+        annotation_text=f"Overall Avg: ${avg_winkler:.0f}",
+        annotation_position="top right"
+    )
+    
+    fig_winkler.update_layout(
+        template="plotly_dark",
+        height=400,
+        xaxis_title="Time (UTC)",
+        yaxis_title="Winkler Score ($)",
+        showlegend=True,
+        hovermode='x unified'
+    )
+    
+    st.plotly_chart(fig_winkler, use_container_width=True)
+    
+    # Recent performance table
+    st.write("**Recent Performance (Last 10 Predictions)**")
+    recent_df = winkler_df.tail(10)[['predicted_for', 'lower_95', 'upper_95', 'actual', 'winkler_score']].copy()
+    recent_df['predicted_for'] = recent_df['predicted_for'].dt.strftime('%Y-%m-%d %H:%M')
+    recent_df.columns = ['Time', 'Low $', 'High $', 'Actual $', 'Winkler $']
+    recent_df['Winkler $'] = recent_df['Winkler $'].round(2)
+    st.dataframe(recent_df, use_container_width=True)
+    
+else:
+    st.info("No settled predictions yet. Winkler scores will appear here after predictions are resolved.")
