@@ -8,6 +8,7 @@ import json
 import os
 from datetime import datetime, timezone
 import pytz
+from supabase import create_client, Client
 
 st.set_page_config(page_title="BTC Next-Hour Forecast", page_icon="₿", layout="wide")
 
@@ -21,17 +22,43 @@ def utc_to_ist(utc_dt_str):
         return utc_dt_str
 
 # ================================================================
-# PART C — PERSISTENCE (Local File)
+# PART C — PERSISTENCE (Supabase + Local Fallback)
 # ================================================================
 HISTORY_FILE = "prediction_history.jsonl"
 
+# Initialize Supabase
+try:
+    supabase_url = st.secrets["SUPABASE_URL"]
+    supabase_key = st.secrets["SUPABASE_KEY"]
+    supabase: Client = create_client(supabase_url, supabase_key)
+except Exception as e:
+    st.error(f"Supabase connection failed: {e}")
+    supabase = None
+
 def load_history():
+    """Load history from Supabase with local fallback"""
+    if supabase:
+        try:
+            response = supabase.table("predictions").select("*").order("predicted_for", desc=False).execute()
+            return response.data
+        except Exception as e:
+            st.warning(f"Supabase fetch failed, falling back to local: {e}")
+    
     if not os.path.exists(HISTORY_FILE):
         return []
     with open(HISTORY_FILE, "r") as f:
         return [json.loads(line) for line in f if line.strip()]
 
 def save_prediction(record):
+    """Save to Supabase and local file"""
+    # 1. Save to Supabase
+    if supabase:
+        try:
+            supabase.table("predictions").insert(record).execute()
+        except Exception as e:
+            st.error(f"Supabase insert failed: {e}")
+    
+    # 2. Save to Local
     with open(HISTORY_FILE, "a") as f:
         f.write(json.dumps(record) + "\n")
 
@@ -48,16 +75,27 @@ def calculate_winkler_score(lower, upper, actual):
             return width + 2 * (actual - upper)
 
 def update_actuals(history, prices):
+    """Update missing actuals and sync with Supabase"""
     price_dict = {str(t): float(p) for t, p in zip(prices.index, prices.values)}
     updated = []
     for r in history:
-        if r["actual"] is None:
+        if r.get("actual") is None:
             actual_price = price_dict.get(r["predicted_for"])
             if actual_price:
                 r["actual"] = round(actual_price, 2)
                 r["hit"]    = int(r["lower_95"] <= actual_price <= r["upper_95"])
-                # Calculate Winkler score
                 r["winkler_score"] = calculate_winkler_score(r["lower_95"], r["upper_95"], r["actual"])
+                
+                # Sync update to Supabase
+                if supabase:
+                    try:
+                        supabase.table("predictions").update({
+                            "actual": r["actual"],
+                            "hit": r["hit"],
+                            "winkler_score": r["winkler_score"]
+                        }).eq("predicted_for", r["predicted_for"]).execute()
+                    except Exception as e:
+                        st.error(f"Supabase update failed for {r['predicted_for']}: {e}")
         updated.append(r)
     return updated
 
@@ -271,15 +309,6 @@ st.divider()
 # ================================================================
 st.subheader("🕐 Prediction History")
 st.caption("Every dashboard visit saves a prediction. Actuals fill in automatically when the bar closes.")
-with st.expander("🔧 Admin — Delete a row"):
-    del_time = st.text_input("Predicting For value paste karo:")
-    if st.button("Delete Row"):
-        history = [r for r in history if r["predicted_for"] != del_time]
-        with open(HISTORY_FILE, "w") as f:
-            for r in history:
-                f.write(json.dumps(r) + "\n")
-        st.success("Deleted!")
-        st.rerun()
 
 # Save current prediction if not already saved for this bar
 predicted_for = str(next_bar_time)
@@ -292,15 +321,18 @@ if not already_saved:
         "lower_95"     : round(lower, 2),
         "upper_95"     : round(upper, 2),
         "actual"       : None,
-        "hit"          : None
+        "hit"          : None,
+        "winkler_score": None
     }
     save_prediction(new_record)
     history.append(new_record)
 
-# Rewrite file with updated actuals
-with open(HISTORY_FILE, "w") as f:
-    for r in history:
-        f.write(json.dumps(r) + "\n")
+# Rewrite local file with updated actuals periodically
+# (Database is already synced in update_actuals)
+if not supabase: # Only need frequent rewrites if Supabase is offline
+    with open(HISTORY_FILE, "w") as f:
+        for r in history:
+            f.write(json.dumps(r) + "\n")
 
 if history:
     hist_df = pd.DataFrame(history[::-1])  # newest first
